@@ -10,6 +10,11 @@
 (define-data-var is-paused bool false)
 (define-data-var owner principal tx-sender)
 
+(define-map milestones uint { name: (string-ascii 64), reward-multiplier: uint, unlock-feature: (string-ascii 32) })
+(define-map achieved-milestones uint bool)
+(define-data-var next-milestone-id uint u1)
+(define-data-var total-milestones-achieved uint u0)
+
 (define-read-only (get-counter)
     (var-get counter)
 )
@@ -63,13 +68,15 @@
     (let ((current-value (get-counter))
           (current-increments (get-total-increments))
           (current-multiplier (get-multiplier))
-          (current-max-value (get-max-value)))
+          (current-max-value (get-max-value))
+          (new-value (+ current-value current-multiplier)))
         (asserts! (not (get-is-paused)) err-unauthorized)
-        (asserts! (<= (+ current-value current-multiplier) current-max-value) err-overflow)
-        (var-set counter (+ current-value current-multiplier))
+        (asserts! (<= new-value current-max-value) err-overflow)
+        (var-set counter new-value)
         (var-set total-increments (+ current-increments u1))
-        (print { event: "counter-incremented", old-value: current-value, new-value: (+ current-value current-multiplier), multiplier: current-multiplier })
-        (ok (+ current-value current-multiplier))
+        (check-and-trigger-milestones new-value)
+        (print { event: "counter-incremented", old-value: current-value, new-value: new-value, multiplier: current-multiplier })
+        (ok new-value)
     )
 )
 
@@ -105,13 +112,15 @@
 (define-public (add-to-counter (amount uint))
     (let ((current-value (get-counter))
           (current-increments (get-total-increments))
-          (current-max-value (get-max-value)))
+          (current-max-value (get-max-value))
+          (new-value (+ current-value amount)))
         (asserts! (not (get-is-paused)) err-unauthorized)
-        (asserts! (<= (+ current-value amount) current-max-value) err-overflow)
-        (var-set counter (+ current-value amount))
+        (asserts! (<= new-value current-max-value) err-overflow)
+        (var-set counter new-value)
         (var-set total-increments (+ current-increments u1))
-        (print { event: "counter-increased", amount: amount, old-value: current-value, new-value: (+ current-value amount) })
-        (ok (+ current-value amount))
+        (check-and-trigger-milestones new-value)
+        (print { event: "counter-increased", amount: amount, old-value: current-value, new-value: new-value })
+        (ok new-value)
     )
 )
 
@@ -202,14 +211,16 @@
     (let ((current-value (get-counter))
           (current-multiplier (get-multiplier))
           (current-max-value (get-max-value))
-          (total-increase (* times current-multiplier)))
+          (total-increase (* times current-multiplier))
+          (new-value (+ current-value total-increase)))
         (asserts! (not (get-is-paused)) err-unauthorized)
         (asserts! (> times u0) err-invalid-args)
-        (asserts! (<= (+ current-value total-increase) current-max-value) err-overflow)
-        (var-set counter (+ current-value total-increase))
+        (asserts! (<= new-value current-max-value) err-overflow)
+        (var-set counter new-value)
         (var-set total-increments (+ (get-total-increments) times))
-        (print { event: "batch-increment", times: times, old-value: current-value, new-value: (+ current-value total-increase) })
-        (ok (+ current-value total-increase))
+        (check-and-trigger-milestones new-value)
+        (print { event: "batch-increment", times: times, old-value: current-value, new-value: new-value })
+        (ok new-value)
     )
 )
 
@@ -222,7 +233,10 @@
         multiplier: (get-multiplier),
         max-value: (get-max-value),
         is-paused: (get-is-paused),
-        owner: (get-owner)
+        owner: (get-owner),
+        milestones-achieved: (get-total-milestones-achieved),
+        next-milestone: (get-next-milestone),
+        milestone-progress: (get-milestone-progress)
     }
 )
 
@@ -259,4 +273,101 @@
           (current-max-value (get-max-value)))
         (- current-max-value current-value)
     )
+)
+
+(define-public (create-milestone (target-value uint) (milestone-name (string-ascii 64)) (reward-mult uint) (unlock-feat (string-ascii 32)))
+    (let ((milestone-id (var-get next-milestone-id)))
+        (asserts! (is-authorized) err-unauthorized)
+        (asserts! (> target-value u0) err-invalid-args)
+        (asserts! (> reward-mult u0) err-invalid-args)
+        (map-set milestones target-value { 
+            name: milestone-name, 
+            reward-multiplier: reward-mult, 
+            unlock-feature: unlock-feat 
+        })
+        (var-set next-milestone-id (+ milestone-id u1))
+        (print { event: "milestone-created", target: target-value, name: milestone-name, reward: reward-mult })
+        (ok target-value)
+    )
+)
+
+(define-public (remove-milestone (target-value uint))
+    (begin
+        (asserts! (is-authorized) err-unauthorized)
+        (map-delete milestones target-value)
+        (map-delete achieved-milestones target-value)
+        (print { event: "milestone-removed", target: target-value })
+        (ok target-value)
+    )
+)
+
+(define-private (check-and-trigger-milestones (new-value uint))
+    (let ((milestone-data (map-get? milestones new-value)))
+        (match milestone-data
+            milestone-info (if (not (default-to false (map-get? achieved-milestones new-value)))
+                (begin
+                    (map-set achieved-milestones new-value true)
+                    (var-set total-milestones-achieved (+ (var-get total-milestones-achieved) u1))
+                    (var-set multiplier (get reward-multiplier milestone-info))
+                    (print { 
+                        event: "milestone-achieved", 
+                        target: new-value, 
+                        name: (get name milestone-info),
+                        reward-multiplier: (get reward-multiplier milestone-info),
+                        unlock-feature: (get unlock-feature milestone-info)
+                    })
+                    true
+                )
+                false
+            )
+            false
+        )
+    )
+)
+
+(define-read-only (get-milestone (target-value uint))
+    (map-get? milestones target-value)
+)
+
+(define-read-only (is-milestone-achieved (target-value uint))
+    (default-to false (map-get? achieved-milestones target-value))
+)
+
+(define-read-only (get-total-milestones-achieved)
+    (var-get total-milestones-achieved)
+)
+
+(define-read-only (get-next-milestone)
+    (let ((current-value (get-counter)))
+        (fold find-next-milestone (list u1 u10 u25 u50 u100 u250 u500 u1000 u2500 u5000 u10000) none)
+    )
+)
+
+(define-private (find-next-milestone (target uint) (current-best (optional uint)))
+    (if (and (> target (get-counter)) (is-some (get-milestone target)) (not (is-milestone-achieved target)))
+        (match current-best
+            best (if (< target best) (some target) current-best)
+            (some target)
+        )
+        current-best
+    )
+)
+
+(define-read-only (get-milestone-progress)
+    (let ((current-value (get-counter))
+          (next-milestone (get-next-milestone)))
+        (match next-milestone
+            target (/ (* current-value u100) target)
+            u100
+        )
+    )
+)
+
+(define-read-only (get-achievements-summary)
+    {
+        total-achieved: (get-total-milestones-achieved),
+        current-counter: (get-counter),
+        next-milestone: (get-next-milestone),
+        progress-percentage: (get-milestone-progress)
+    }
 )
