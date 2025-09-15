@@ -15,6 +15,13 @@
 (define-data-var next-milestone-id uint u1)
 (define-data-var total-milestones-achieved uint u0)
 
+(define-map user-cooldowns principal uint)
+(define-map scheduled-operations uint { operation: (string-ascii 32), target-block: uint, amount: uint, requester: principal })
+(define-data-var global-cooldown-period uint u10)
+(define-data-var next-scheduled-id uint u1)
+(define-data-var time-lock-enabled bool false)
+(define-data-var time-lock-duration uint u144)
+
 (define-read-only (get-counter)
     (var-get counter)
 )
@@ -236,7 +243,10 @@
         owner: (get-owner),
         milestones-achieved: (get-total-milestones-achieved),
         next-milestone: (get-next-milestone),
-        milestone-progress: (get-milestone-progress)
+        milestone-progress: (get-milestone-progress),
+        current-block: stacks-block-height,
+        global-cooldown: (var-get global-cooldown-period),
+        time-lock-enabled: (var-get time-lock-enabled)
     }
 )
 
@@ -369,5 +379,160 @@
         current-counter: (get-counter),
         next-milestone: (get-next-milestone),
         progress-percentage: (get-milestone-progress)
+    }
+)
+
+(define-private (check-cooldown (user principal))
+    (let ((last-operation (default-to u0 (map-get? user-cooldowns user)))
+          (current-block stacks-block-height)
+          (cooldown-period (var-get global-cooldown-period)))
+        (>= current-block (+ last-operation cooldown-period))
+    )
+)
+
+(define-private (update-cooldown (user principal))
+    (map-set user-cooldowns user stacks-block-height)
+)
+
+(define-public (set-cooldown-period (new-period uint))
+    (begin
+        (asserts! (is-authorized) err-unauthorized)
+        (asserts! (> new-period u0) err-invalid-args)
+        (var-set global-cooldown-period new-period)
+        (print { event: "cooldown-period-updated", new-period: new-period })
+        (ok new-period)
+    )
+)
+
+(define-public (set-time-lock (enabled bool) (duration uint))
+    (begin
+        (asserts! (is-authorized) err-unauthorized)
+        (var-set time-lock-enabled enabled)
+        (var-set time-lock-duration duration)
+        (print { event: "time-lock-updated", enabled: enabled, duration: duration })
+        (ok enabled)
+    )
+)
+
+(define-public (schedule-operation (operation (string-ascii 32)) (delay-blocks uint) (amount uint))
+    (let ((schedule-id (var-get next-scheduled-id))
+          (target-block (+ stacks-block-height delay-blocks)))
+        (asserts! (check-cooldown tx-sender) err-unauthorized)
+        (asserts! (> delay-blocks u0) err-invalid-args)
+        (map-set scheduled-operations schedule-id {
+            operation: operation,
+            target-block: target-block,
+            amount: amount,
+            requester: tx-sender
+        })
+        (var-set next-scheduled-id (+ schedule-id u1))
+        (update-cooldown tx-sender)
+        (print { event: "operation-scheduled", id: schedule-id, operation: operation, target-block: target-block })
+        (ok schedule-id)
+    )
+)
+
+(define-public (execute-scheduled-operation (schedule-id uint))
+    (let ((operation-data (unwrap! (map-get? scheduled-operations schedule-id) err-invalid-args)))
+        (asserts! (>= stacks-block-height (get target-block operation-data)) err-unauthorized)
+        (asserts! (is-eq tx-sender (get requester operation-data)) err-unauthorized)
+        (map-delete scheduled-operations schedule-id)
+        (if (is-eq (get operation operation-data) "increment")
+            (begin
+                (try! (increment))
+                (ok "increment-executed")
+            )
+            (if (is-eq (get operation operation-data) "add")
+                (begin
+                    (try! (add-to-counter (get amount operation-data)))
+                    (ok "add-executed")
+                )
+                (if (is-eq (get operation operation-data) "reset")
+                    (begin
+                        (try! (reset))
+                        (ok "reset-executed")
+                    )
+                    err-invalid-args
+                )
+            )
+        )
+    )
+)
+
+(define-public (cancel-scheduled-operation (schedule-id uint))
+    (let ((operation-data (unwrap! (map-get? scheduled-operations schedule-id) err-invalid-args)))
+        (asserts! (is-eq tx-sender (get requester operation-data)) err-unauthorized)
+        (map-delete scheduled-operations schedule-id)
+        (print { event: "operation-cancelled", id: schedule-id })
+        (ok schedule-id)
+    )
+)
+
+(define-public (increment-with-cooldown)
+    (begin
+        (asserts! (check-cooldown tx-sender) err-unauthorized)
+        (try! (increment))
+        (update-cooldown tx-sender)
+        (ok (get-counter))
+    )
+)
+
+(define-public (add-with-cooldown (amount uint))
+    (begin
+        (asserts! (check-cooldown tx-sender) err-unauthorized)
+        (try! (add-to-counter amount))
+        (update-cooldown tx-sender)
+        (ok (get-counter))
+    )
+)
+
+(define-public (time-locked-reset)
+    (let ((time-lock-active (var-get time-lock-enabled))
+          (lock-duration (var-get time-lock-duration)))
+        (asserts! (is-authorized) err-unauthorized)
+        (if time-lock-active
+            (try! (schedule-operation "reset" lock-duration u0))
+            (try! (reset))
+        )
+        (print { event: "time-locked-reset-initiated", time-lock-active: time-lock-active })
+        (ok time-lock-active)
+    )
+)
+
+(define-read-only (get-cooldown-status (user principal))
+    (let ((last-operation (default-to u0 (map-get? user-cooldowns user)))
+          (current-block stacks-block-height)
+          (cooldown-period (var-get global-cooldown-period)))
+        {
+            last-operation-block: last-operation,
+            current-block: current-block,
+            cooldown-period: cooldown-period,
+            blocks-remaining: (if (> (+ last-operation cooldown-period) current-block)
+                                 (- (+ last-operation cooldown-period) current-block)
+                                 u0),
+            can-operate: (check-cooldown user)
+        }
+    )
+)
+
+(define-read-only (get-scheduled-operation (schedule-id uint))
+    (map-get? scheduled-operations schedule-id)
+)
+
+(define-read-only (get-time-lock-settings)
+    {
+        enabled: (var-get time-lock-enabled),
+        duration: (var-get time-lock-duration),
+        cooldown-period: (var-get global-cooldown-period)
+    }
+)
+
+(define-read-only (get-operation-timing-info)
+    {
+        current-block: stacks-block-height,
+        global-cooldown: (var-get global-cooldown-period),
+        time-lock-enabled: (var-get time-lock-enabled),
+        time-lock-duration: (var-get time-lock-duration),
+        next-scheduled-id: (var-get next-scheduled-id)
     }
 )
