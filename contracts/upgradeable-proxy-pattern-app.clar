@@ -22,6 +22,12 @@
 (define-data-var time-lock-enabled bool false)
 (define-data-var time-lock-duration uint u144)
 
+(define-map user-contributions principal { total-increments: uint, total-value-added: uint, largest-single-contribution: uint, first-interaction: uint, last-interaction: uint })
+(define-map leaderboard-entries uint principal)
+(define-data-var leaderboard-size uint u10)
+(define-data-var total-participants uint u0)
+(define-data-var competition-start-block uint u0)
+
 (define-read-only (get-counter)
     (var-get counter)
 )
@@ -246,7 +252,9 @@
         milestone-progress: (get-milestone-progress),
         current-block: stacks-block-height,
         global-cooldown: (var-get global-cooldown-period),
-        time-lock-enabled: (var-get time-lock-enabled)
+        time-lock-enabled: (var-get time-lock-enabled),
+        total-participants: (var-get total-participants),
+        leaderboard-size: (var-get leaderboard-size)
     }
 )
 
@@ -535,4 +543,229 @@
         time-lock-duration: (var-get time-lock-duration),
         next-scheduled-id: (var-get next-scheduled-id)
     }
+)
+
+(define-private (record-contribution (user principal) (value-added uint))
+    (let ((existing-data (map-get? user-contributions user)))
+        (match existing-data
+            data (map-set user-contributions user {
+                total-increments: (+ (get total-increments data) u1),
+                total-value-added: (+ (get total-value-added data) value-added),
+                largest-single-contribution: (if (> value-added (get largest-single-contribution data)) 
+                                                value-added 
+                                                (get largest-single-contribution data)),
+                first-interaction: (get first-interaction data),
+                last-interaction: stacks-block-height
+            })
+            (begin
+                (map-set user-contributions user {
+                    total-increments: u1,
+                    total-value-added: value-added,
+                    largest-single-contribution: value-added,
+                    first-interaction: stacks-block-height,
+                    last-interaction: stacks-block-height
+                })
+                (var-set total-participants (+ (var-get total-participants) u1))
+            )
+        )
+    )
+)
+
+(define-public (start-competition)
+    (begin
+        (asserts! (is-authorized) err-unauthorized)
+        (var-set competition-start-block stacks-block-height)
+        (print { event: "competition-started", block: stacks-block-height })
+        (ok stacks-block-height)
+    )
+)
+
+(define-public (reset-leaderboard)
+    (begin
+        (asserts! (is-authorized) err-unauthorized)
+        (var-set total-participants u0)
+        (var-set competition-start-block stacks-block-height)
+        (print { event: "leaderboard-reset", block: stacks-block-height })
+        (ok true)
+    )
+)
+
+(define-public (set-leaderboard-size (new-size uint))
+    (begin
+        (asserts! (is-authorized) err-unauthorized)
+        (asserts! (and (> new-size u0) (<= new-size u100)) err-invalid-args)
+        (var-set leaderboard-size new-size)
+        (print { event: "leaderboard-size-updated", new-size: new-size })
+        (ok new-size)
+    )
+)
+
+(define-public (tracked-increment)
+    (begin
+        (try! (increment))
+        (record-contribution tx-sender u1)
+        (ok (get-counter))
+    )
+)
+
+(define-public (tracked-add (amount uint))
+    (begin
+        (try! (add-to-counter amount))
+        (record-contribution tx-sender amount)
+        (ok (get-counter))
+    )
+)
+
+(define-public (tracked-batch-increment (times uint))
+    (begin
+        (try! (batch-increment times))
+        (record-contribution tx-sender times)
+        (ok (get-counter))
+    )
+)
+
+(define-read-only (get-user-stats (user principal))
+    (map-get? user-contributions user)
+)
+
+(define-read-only (get-user-rank (user principal))
+    (let ((user-data (map-get? user-contributions user)))
+        (match user-data
+            data (let ((user-score (get total-value-added data)))
+                (ok (fold calculate-rank-position 
+                    (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20)
+                    { target-user: user, target-score: user-score, current-rank: u1, found: false }))
+            )
+            (ok { target-user: user, target-score: u0, current-rank: u0, found: false })
+        )
+    )
+)
+
+(define-private (calculate-rank-position (position uint) (state { target-user: principal, target-score: uint, current-rank: uint, found: bool }))
+    (if (get found state)
+        state
+        (let ((entry-user (map-get? leaderboard-entries position)))
+            (match entry-user
+                user-principal (let ((entry-data (unwrap-panic (map-get? user-contributions user-principal))))
+                    (if (is-eq (get target-user state) user-principal)
+                        { target-user: (get target-user state), target-score: (get target-score state), current-rank: position, found: true }
+                        { target-user: (get target-user state), target-score: (get target-score state), current-rank: (+ position u1), found: false }
+                    )
+                )
+                { target-user: (get target-user state), target-score: (get target-score state), current-rank: position, found: false }
+            )
+        )
+    )
+)
+
+(define-read-only (get-top-contributors (limit uint))
+    (let ((max-limit (if (<= limit (var-get leaderboard-size)) limit (var-get leaderboard-size))))
+        (ok (fold build-leaderboard-list
+            (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+            (list)
+        ))
+    )
+)
+
+(define-private (build-leaderboard-list (position uint) (result (list 10 { user: principal, total-value: uint, increments: uint })))
+    (let ((entry-user (map-get? leaderboard-entries position)))
+        (match entry-user
+            user-principal (let ((user-data (map-get? user-contributions user-principal)))
+                (match user-data
+                    data (unwrap-panic (as-max-len? 
+                        (append result { 
+                            user: user-principal, 
+                            total-value: (get total-value-added data),
+                            increments: (get total-increments data)
+                        }) 
+                        u10))
+                    result
+                )
+            )
+            result
+        )
+    )
+)
+
+(define-read-only (get-leaderboard-stats)
+    {
+        total-participants: (var-get total-participants),
+        leaderboard-size: (var-get leaderboard-size),
+        competition-start: (var-get competition-start-block),
+        current-block: stacks-block-height,
+        blocks-since-start: (- stacks-block-height (var-get competition-start-block))
+    }
+)
+
+(define-read-only (get-user-performance-metrics (user principal))
+    (let ((user-data (map-get? user-contributions user)))
+        (match user-data
+            data {
+                total-increments: (get total-increments data),
+                total-value-added: (get total-value-added data),
+                largest-contribution: (get largest-single-contribution data),
+                average-contribution: (if (> (get total-increments data) u0)
+                                        (/ (get total-value-added data) (get total-increments data))
+                                        u0),
+                first-seen: (get first-interaction data),
+                last-seen: (get last-interaction data),
+                activity-span: (- (get last-interaction data) (get first-interaction data)),
+                is-active: (< (- stacks-block-height (get last-interaction data)) u144)
+            }
+            {
+                total-increments: u0,
+                total-value-added: u0,
+                largest-contribution: u0,
+                average-contribution: u0,
+                first-seen: u0,
+                last-seen: u0,
+                activity-span: u0,
+                is-active: false
+            }
+        )
+    )
+)
+
+(define-public (claim-leaderboard-spot (position uint))
+    (let ((user-data (unwrap! (map-get? user-contributions tx-sender) err-invalid-args))
+          (user-score (get total-value-added user-data))
+          (current-holder (map-get? leaderboard-entries position)))
+        (asserts! (<= position (var-get leaderboard-size)) err-invalid-args)
+        (match current-holder
+            holder-principal (let ((holder-data (unwrap-panic (map-get? user-contributions holder-principal))))
+                (asserts! (> user-score (get total-value-added holder-data)) err-unauthorized)
+                (map-set leaderboard-entries position tx-sender)
+                (print { event: "leaderboard-spot-claimed", user: tx-sender, position: position, score: user-score })
+                (ok position)
+            )
+            (begin
+                (map-set leaderboard-entries position tx-sender)
+                (print { event: "leaderboard-spot-claimed", user: tx-sender, position: position, score: user-score })
+                (ok position)
+            )
+        )
+    )
+)
+
+(define-read-only (compare-users (user-a principal) (user-b principal))
+    (let ((data-a (map-get? user-contributions user-a))
+          (data-b (map-get? user-contributions user-b)))
+        (match data-a
+            stats-a (match data-b
+                stats-b {
+                    user-a-score: (get total-value-added stats-a),
+                    user-b-score: (get total-value-added stats-b),
+                    leader: (if (> (get total-value-added stats-a) (get total-value-added stats-b)) user-a user-b),
+                    difference: (if (> (get total-value-added stats-a) (get total-value-added stats-b))
+                                   (- (get total-value-added stats-a) (get total-value-added stats-b))
+                                   (- (get total-value-added stats-b) (get total-value-added stats-a)))
+                }
+                { user-a-score: (get total-value-added stats-a), user-b-score: u0, leader: user-a, difference: (get total-value-added stats-a) }
+            )
+            (match data-b
+                stats-b { user-a-score: u0, user-b-score: (get total-value-added stats-b), leader: user-b, difference: (get total-value-added stats-b) }
+                { user-a-score: u0, user-b-score: u0, leader: user-a, difference: u0 }
+            )
+        )
+    )
 )
