@@ -9,6 +9,7 @@
 (define-data-var max-value uint u1000000)
 (define-data-var is-paused bool false)
 (define-data-var owner principal tx-sender)
+(define-data-var pending-owner (optional principal) none)
 
 (define-map milestones uint { name: (string-ascii 64), reward-multiplier: uint, unlock-feature: (string-ascii 32) })
 (define-map achieved-milestones uint bool)
@@ -60,6 +61,10 @@
     (var-get owner)
 )
 
+(define-read-only (get-pending-owner)
+    (var-get pending-owner)
+)
+
 (define-read-only (get-version)
     "2.0.0"
 )
@@ -74,6 +79,36 @@
         (var-set owner new-owner)
         (print { event: "owner-changed", old-owner: (var-get owner), new-owner: new-owner })
         (ok new-owner)
+    )
+)
+
+(define-public (transfer-ownership (new-owner principal))
+    (begin
+        (asserts! (is-authorized) err-unauthorized)
+        (asserts! (not (is-eq new-owner (var-get owner))) err-invalid-args)
+        (var-set pending-owner (some new-owner))
+        (print { event: "ownership-transfer-initiated", current-owner: (var-get owner), pending-owner: new-owner })
+        (ok new-owner)
+    )
+)
+
+(define-public (accept-ownership)
+    (let ((po (unwrap! (var-get pending-owner) err-invalid-args))
+          (old (var-get owner)))
+        (asserts! (is-eq tx-sender po) err-unauthorized)
+        (var-set owner tx-sender)
+        (var-set pending-owner none)
+        (print { event: "ownership-transferred", old-owner: old, new-owner: tx-sender })
+        (ok tx-sender)
+    )
+)
+
+(define-public (cancel-ownership-transfer)
+    (begin
+        (asserts! (is-authorized) err-unauthorized)
+        (var-set pending-owner none)
+        (print { event: "ownership-transfer-cancelled" })
+        (ok true)
     )
 )
 
