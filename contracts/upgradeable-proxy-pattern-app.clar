@@ -23,6 +23,9 @@
 (define-data-var time-lock-enabled bool false)
 (define-data-var time-lock-duration uint u144)
 
+(define-map state-snapshots uint { label: (string-ascii 64), block: uint, counter: uint, total-increments: uint, name: (string-ascii 256), multiplier: uint, max-value: uint, is-paused: bool })
+(define-data-var next-snapshot-id uint u1)
+
 (define-map user-contributions principal { total-increments: uint, total-value-added: uint, largest-single-contribution: uint, first-interaction: uint, last-interaction: uint })
 (define-map leaderboard-entries uint principal)
 (define-data-var leaderboard-size uint u10)
@@ -802,5 +805,61 @@
                 { user-a-score: u0, user-b-score: u0, leader: user-a, difference: u0 }
             )
         )
+    )
+)
+
+(define-public (take-snapshot (label (string-ascii 64)))
+    (let ((id (var-get next-snapshot-id))
+          (current-block stacks-block-height)
+          (current-counter (var-get counter))
+          (current-total (var-get total-increments))
+          (current-name (var-get name))
+          (current-multiplier (var-get multiplier))
+          (current-max (var-get max-value))
+          (current-paused (var-get is-paused)))
+        (asserts! (is-authorized) err-unauthorized)
+        (map-set state-snapshots id {
+            label: label,
+            block: current-block,
+            counter: current-counter,
+            total-increments: current-total,
+            name: current-name,
+            multiplier: current-multiplier,
+            max-value: current-max,
+            is-paused: current-paused
+        })
+        (var-set next-snapshot-id (+ id u1))
+        (print { event: "snapshot-created", id: id, block: current-block })
+        (ok id)
+    )
+)
+
+(define-public (restore-snapshot (id uint))
+    (let ((snap (unwrap! (map-get? state-snapshots id) err-invalid-args)))
+        (asserts! (is-authorized) err-unauthorized)
+        (var-set counter (get counter snap))
+        (var-set total-increments (get total-increments snap))
+        (var-set name (get name snap))
+        (var-set multiplier (get multiplier snap))
+        (var-set max-value (get max-value snap))
+        (var-set is-paused (get is-paused snap))
+        (print { event: "snapshot-restored", id: id })
+        (ok true)
+    )
+)
+
+(define-read-only (get-snapshot (id uint))
+    (map-get? state-snapshots id)
+)
+
+(define-read-only (get-latest-snapshot-id)
+    (let ((n (var-get next-snapshot-id)))
+        (if (> n u1) (- n u1) u0)
+    )
+)
+
+(define-read-only (get-latest-snapshot)
+    (let ((latest (get-latest-snapshot-id)))
+        (map-get? state-snapshots latest)
     )
 )
